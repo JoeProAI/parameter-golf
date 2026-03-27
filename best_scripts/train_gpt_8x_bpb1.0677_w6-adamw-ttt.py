@@ -391,6 +391,14 @@ INT6_MAX = 31
 INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", "99.99984"))
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 
+# Mixed precision: int5 for MLP (saves ~35% on the largest tensors), int6 for attention
+# MLP is ~60% of params but more tolerant of quantization than attention
+INT5_MIN = -15
+INT5_MAX = 15
+INT5_CLIP_PERCENTILE = float(os.environ.get("INT5_CLIP_PERCENTILE", "99.99984"))
+INT5_CLIP_Q = INT5_CLIP_PERCENTILE / 100.0
+MIXED_QUANT = bool(int(os.environ.get("MIXED_QUANT", "0")))
+
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -441,6 +449,22 @@ def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), INT6_MIN, INT6_MAX).to(torch.int8).contiguous()
     return q, scale
 
+def quantize_float_tensor_int5(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize to int5 range [-15, 15], stored as int8. Per-row percentile clipping."""
+    t32 = t.float()
+    if t32.ndim >= 2:
+        clip_abs = torch.quantile(t32.abs(), INT5_CLIP_Q, dim=1)
+        clip_abs = clip_abs.clamp_min(1.0 / float(INT5_MAX))
+        scale = (clip_abs / float(INT5_MAX)).to(torch.float16)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        q = torch.clamp(torch.round(clipped / scale[:, None].float()), INT5_MIN, INT5_MAX).to(torch.int8).contiguous()
+        return q, scale
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT5_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / float(INT5_MAX) if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), INT5_MIN, INT5_MAX).to(torch.int8).contiguous()
+    return q, scale
+
+
 def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -473,9 +497,16 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int6(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        # Mixed quant: MLP tensors get int5 (smaller), attention gets int6 (more precise)
+        is_mlp = MIXED_QUANT and any(pat in name for pat in (".mlp.", "mlp.fc", "mlp.w1", "mlp.w2", "mlp.w3", "fc1.", "fc2."))
+        if is_mlp:
+            q, s = quantize_float_tensor_int5(t)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row_int5", "axis": 0}
+        else:
+            q, s = quantize_float_tensor_int6(t)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -501,7 +532,7 @@ def dequantize_state_dict_int6(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        if qmeta.get(name, {}).get("scheme") in ("per_row", "per_row_int5") or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
@@ -597,18 +628,24 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Class-level flag: set True during late-QAT phase to enable fake int6 STE
+    # Class-level flag: set True during late-QAT phase to enable fake quant STE
     _qat_enabled: bool = False
+    # Set per-layer: True if this layer should use int5 QAT (MLP layers in mixed quant mode)
+    _use_int5_qat: bool = False
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            # Fake int6 quantization via straight-through estimator
+            # Mixed quant: MLP layers use int5 STE, attention layers use int6 STE
+            if MIXED_QUANT and self._use_int5_qat:
+                q_min, q_max = INT5_MIN, INT5_MAX
+            else:
+                q_min, q_max = INT6_MIN, INT6_MAX
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                scale = (row_max / float(q_max)).clamp_min(1.0 / float(q_max))
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), q_min, q_max) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -1128,9 +1165,11 @@ def main() -> None:
         ln_scale=args.ln_scale,
         xsa_last_n=args.xsa_layers,
     ).to(device).bfloat16()
-    for module in base_model.modules():
+    for module_name, module in base_model.named_modules():
         if isinstance(module, CastedLinear):
             module.float()
+            if MIXED_QUANT:
+                module._use_int5_qat = any(pat in module_name for pat in (".mlp.", "mlp.fc", "mlp.w1", "mlp.w2", "mlp.w3", "fc1", "fc2"))
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
